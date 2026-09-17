@@ -95,14 +95,18 @@ function messageChange(
   }
 }
 
-function bindMessages() {
+function bindMessages({ wait = true }: { wait?: boolean } = {}) {
   const target = ref<unknown[]>([])
   let resolveBinding!: (value: unknown) => void
   let rejectBinding!: (reason: unknown) => void
   let resolvedWith: unknown
+  // without `wait`, the bound array is the one passed to the resolve callback:
+  // the test target ref is not the one vuefire keeps writing into
+  let boundArray: unknown[] | undefined
   const promise = new Promise((resolve, reject) => {
     resolveBinding = (value) => {
       resolvedWith ??= JSON.parse(JSON.stringify(value))
+      boundArray ??= value as unknown[]
       resolve(value)
     }
     rejectBinding = reject
@@ -114,10 +118,16 @@ function bindMessages() {
     ops,
     resolveBinding,
     rejectBinding,
-    { maxRefDepth: 2, wait: true }
+    { maxRefDepth: 2, wait }
   )
 
-  return { promise, stop, target, resolvedWith: () => resolvedWith }
+  return {
+    promise,
+    stop,
+    target,
+    resolvedWith: () => resolvedWith,
+    boundArray: () => boundArray ?? target.value,
+  }
 }
 
 describe('Firestore nested reference lifecycle', () => {
@@ -294,5 +304,212 @@ describe('Firestore nested reference lifecycle', () => {
       createdBy: { name: 'Alice updated' },
     })
     stop()
+  })
+
+  describe('siblings shifted while pending', () => {
+    it('keeps a pending row bound when a document is added before it', async () => {
+      const { promise, stop, target } = bindMessages()
+
+      emitCollection([
+        messageChange(
+          'added',
+          { sender: documentReference('agents/a2') },
+          { id: 'message-2', newIndex: 0 }
+        ),
+      ])
+
+      emitCollection([
+        messageChange(
+          'added',
+          { sender: documentReference('agents/a1') },
+          { id: 'message-1', newIndex: 0 }
+        ),
+      ])
+
+      emitDocument('agents/a1', { name: 'Ada' })
+      emitDocument('agents/a2', { name: 'Bob' })
+
+      await promise
+      expect(target.value).toEqual([
+        { sender: { name: 'Ada' } },
+        { sender: { name: 'Bob' } },
+      ])
+      stop()
+    })
+
+    it('keeps a pending row bound when a document is added before it without wait', async () => {
+      const { promise, stop, boundArray } = bindMessages({ wait: false })
+
+      emitCollection([
+        messageChange(
+          'added',
+          { sender: documentReference('agents/a2') },
+          { id: 'message-2', newIndex: 0 }
+        ),
+      ])
+
+      emitCollection([
+        messageChange(
+          'added',
+          { sender: documentReference('agents/a1') },
+          { id: 'message-1', newIndex: 0 }
+        ),
+      ])
+
+      emitDocument('agents/a1', { name: 'Ada' })
+      emitDocument('agents/a2', { name: 'Bob' })
+
+      await promise
+      expect(boundArray()).toEqual([
+        { sender: { name: 'Ada' } },
+        { sender: { name: 'Bob' } },
+      ])
+      stop()
+    })
+
+    it('keeps a pending row bound when a document before it is removed', async () => {
+      const { promise, stop, target } = bindMessages()
+
+      emitCollection([
+        messageChange(
+          'added',
+          { sender: documentReference('agents/a1') },
+          { id: 'message-1', newIndex: 0 }
+        ),
+        messageChange(
+          'added',
+          { sender: documentReference('agents/a2') },
+          { id: 'message-2', newIndex: 1 }
+        ),
+      ])
+      emitDocument('agents/a1', { name: 'Ada' })
+
+      emitCollection([
+        messageChange(
+          'removed',
+          { sender: documentReference('agents/a1') },
+          { id: 'message-1', oldIndex: 0 }
+        ),
+      ])
+      emitDocument('agents/a2', { name: 'Bob' })
+
+      await promise
+      expect(target.value).toEqual([{ sender: { name: 'Bob' } }])
+      stop()
+    })
+
+    it('keeps a pending row bound when a document before it is removed without wait', async () => {
+      const { promise, stop, boundArray } = bindMessages({ wait: false })
+
+      emitCollection([
+        messageChange(
+          'added',
+          { sender: documentReference('agents/a1') },
+          { id: 'message-1', newIndex: 0 }
+        ),
+        messageChange(
+          'added',
+          { sender: documentReference('agents/a2') },
+          { id: 'message-2', newIndex: 1 }
+        ),
+      ])
+      emitDocument('agents/a1', { name: 'Ada' })
+
+      emitCollection([
+        messageChange(
+          'removed',
+          { sender: documentReference('agents/a1') },
+          { id: 'message-1', oldIndex: 0 }
+        ),
+      ])
+      emitDocument('agents/a2', { name: 'Bob' })
+
+      await promise
+      expect(boundArray()).toEqual([{ sender: { name: 'Bob' } }])
+      stop()
+    })
+
+    it('keeps a pending row bound when another document moves across it', async () => {
+      const { promise, stop, target } = bindMessages()
+
+      emitCollection([
+        messageChange(
+          'added',
+          { sender: documentReference('agents/a1') },
+          { id: 'message-1', newIndex: 0 }
+        ),
+        messageChange(
+          'added',
+          { sender: documentReference('agents/a2') },
+          { id: 'message-2', newIndex: 1 }
+        ),
+      ])
+      emitDocument('agents/a1', { name: 'Ada' })
+      emitDocument('agents/a2', { name: 'Bob' })
+      await promise
+
+      // message-1 points at a document that has not been received yet
+      emitCollection([
+        messageChange(
+          'modified',
+          { sender: documentReference('agents/a3') },
+          { id: 'message-1', oldIndex: 0, newIndex: 0 }
+        ),
+      ])
+
+      // message-2 moves before it, shifting the still pending message-1
+      emitCollection([
+        messageChange(
+          'modified',
+          { sender: documentReference('agents/a2') },
+          { id: 'message-2', oldIndex: 1, newIndex: 0 }
+        ),
+      ])
+
+      emitDocument('agents/a3', { name: 'Charlie' })
+
+      expect(target.value).toEqual([
+        { sender: { name: 'Bob' } },
+        { sender: { name: 'Charlie' } },
+      ])
+      stop()
+    })
+
+    it('keeps a pending row bound when two documents are added before it at once', async () => {
+      const { promise, stop, target } = bindMessages()
+
+      emitCollection([
+        messageChange(
+          'added',
+          { sender: documentReference('agents/a3') },
+          { id: 'message-3', newIndex: 0 }
+        ),
+      ])
+
+      emitCollection([
+        messageChange(
+          'added',
+          { sender: documentReference('agents/a1') },
+          { id: 'message-1', newIndex: 0 }
+        ),
+        messageChange(
+          'added',
+          { sender: documentReference('agents/a2') },
+          { id: 'message-2', newIndex: 1 }
+        ),
+      ])
+
+      emitDocument('agents/a1', { name: 'Ada' })
+      emitDocument('agents/a2', { name: 'Bob' })
+      emitDocument('agents/a3', { name: 'Charlie' })
+
+      await promise
+      expect(target.value).toEqual([
+        { sender: { name: 'Ada' } },
+        { sender: { name: 'Bob' } },
+        { sender: { name: 'Charlie' } },
+      ])
+      stop()
+    })
   })
 })
